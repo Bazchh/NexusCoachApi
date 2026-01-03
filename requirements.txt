@@ -1,0 +1,8 @@
+fastapi
+google-generativeai
+openai
+psycopg[binary]
+python-multipart
+python-dotenv
+redis
+uvicorn[standard]
