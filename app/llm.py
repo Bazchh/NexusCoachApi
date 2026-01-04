@@ -88,6 +88,20 @@ def _build_game_data_block(
             if difficulty:
                 lines.append(f"  - Difficulty: {difficulty}/10")
 
+        abilities = game_data.get_champion_abilities(champion)
+        if abilities:
+            lines.append("  - Abilities:")
+            for ability in abilities[:4]:
+                name = ability.get("name") or ""
+                desc = ability.get("description") or ""
+                short = desc.replace("\n", " " ).strip()
+                if len(short) > 120:
+                    short = short[:117].rstrip() + "..."
+                if name and short:
+                    lines.append(f"    - {name}: {short}")
+                elif name:
+                    lines.append(f"    - {name}")
+
         # Winrate do campeão
         champ_wr = game_data.get_champion_winrate(champion, lane if lane != "unknown" else None)
         if champ_wr:
@@ -187,6 +201,20 @@ def _build_game_data_block(
             if damage:
                 damage_type = "high damage" if damage >= 7 else "moderate damage" if damage >= 4 else "low damage"
                 lines.append(f"  - Threat: {damage_type}")
+
+        enemy_abilities = game_data.get_champion_abilities(enemy)
+        if enemy_abilities:
+            lines.append("  - Enemy abilities:")
+            for ability in enemy_abilities[:4]:
+                name = ability.get("name") or ""
+                desc = ability.get("description") or ""
+                short = desc.replace("\n", " " ).strip()
+                if len(short) > 120:
+                    short = short[:117].rstrip() + "..."
+                if name and short:
+                    lines.append(f"    - {name}: {short}")
+                elif name:
+                    lines.append(f"    - {name}")
 
         # Winrate do inimigo
         enemy_wr = game_data.get_champion_winrate(enemy, lane if lane != "unknown" else None)
@@ -334,6 +362,8 @@ def _build_prompt(
         "\n"
         "IMPORTANT RULES:\n"
         "- This is MOBILE Wild Rift, NOT PC League of Legends.\n"
+        "- If ability data is available in Game Data, it is the source of truth.\n"
+        "- If ability data is missing, do NOT invent ability mechanics.\n"
         "- NEVER use keyboard keys like Q, W, E, R to refer to abilities.\n"
         "- Instead, describe abilities by their VISUAL EFFECT or NAME.\n"
         "  Examples: 'his shadow clone', 'the spinning slash', 'the hook', 'her charm', 'the dash'.\n"

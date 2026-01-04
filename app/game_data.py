@@ -23,7 +23,13 @@ logger = logging.getLogger("nexuscoach")
 TENCENT_HERO_LIST = "https://game.gtimg.cn/images/lgamem/act/lrlib/js/heroList/hero_list.js"
 TENCENT_WINRATES = "https://mlol.qt.qq.com/go/lgame_battle_info/hero_rank_list_v2"
 WR_DATABASE_CHAMPIONS = "https://wr-database.vercel.app/api/champions"
+WR_DATABASE_CHAMPION_DETAIL = "https://wr-database.vercel.app/api/champions/{}"
 WR_META_ITEMS = "https://wr-meta.com/items/"
+TENCENT_HERO_DETAIL_CANDIDATES = [
+    "https://game.gtimg.cn/images/lgamem/act/lrlib/js/hero/{}.js",
+    "https://game.gtimg.cn/images/lgamem/act/lrlib/js/hero/hero_{}.js",
+    "https://game.gtimg.cn/images/lol/act/img/js/hero/{}.js",
+]
 
 # Mapeamento de roles chinês -> português
 ROLE_MAP = {
@@ -59,6 +65,31 @@ def _fetch_json(url: str) -> Any:
     req = Request(url, headers={"User-Agent": "NexusCoach/1.0"})
     with urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _fetch_text(url: str) -> str:
+    req = Request(url, headers={"User-Agent": "NexusCoach/1.0"})
+    with urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8")
+
+
+def _fetch_json_loose(url: str) -> Any | None:
+    try:
+        return _fetch_json(url)
+    except Exception:
+        pass
+    try:
+        text = _fetch_text(url)
+    except Exception:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or start >= end:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except Exception:
+        return None
 
 
 def _ensure_game_tables(conn: psycopg.Connection) -> None:
@@ -100,6 +131,20 @@ def _ensure_game_tables(conn: psycopg.Connection) -> None:
             attack_speed_scale NUMERIC,
             move_speed INT,
             updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS champion_abilities (
+            id BIGSERIAL PRIMARY KEY,
+            hero_id TEXT REFERENCES champions(hero_id),
+            champion_name TEXT,
+            ability_key TEXT,
+            ability_name TEXT,
+            description TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(hero_id, ability_key)
         )
         """
     )
@@ -155,6 +200,142 @@ def _ensure_game_tables(conn: psycopg.Connection) -> None:
         """
     )
     conn.commit()
+
+
+def _strip_html(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", "", text).replace("&nbsp;", " ").strip()
+
+
+def _extract_abilities(champ: dict[str, Any]) -> list[dict[str, str]]:
+    abilities: list[dict[str, str]] = []
+
+    passive = champ.get("passive")
+    if isinstance(passive, dict):
+        name = passive.get("name") or passive.get("abilityName") or ""
+        desc = (
+            passive.get("description")
+            or passive.get("tooltip")
+            or passive.get("desc")
+            or ""
+        )
+        if name or desc:
+            abilities.append(
+                {
+                    "key": "passive",
+                    "name": _strip_html(name),
+                    "description": _strip_html(desc),
+                }
+            )
+    else:
+        name = champ.get("passiveName") or champ.get("passive_name") or ""
+        desc = champ.get("passiveDesc") or champ.get("passive_description") or ""
+        if name or desc:
+            abilities.append(
+                {
+                    "key": "passive",
+                    "name": _strip_html(name),
+                    "description": _strip_html(desc),
+                }
+            )
+
+    spells = champ.get("spells") or champ.get("abilities") or champ.get("skills")
+    if isinstance(spells, dict):
+        spells = spells.get("spells") or spells.get("skills") or spells.get("abilities")
+    if isinstance(spells, list):
+        keys = ["q", "w", "e", "r"]
+        for idx, spell in enumerate(spells):
+            if not isinstance(spell, dict):
+                continue
+            key = keys[idx] if idx < len(keys) else f"skill_{idx + 1}"
+            name = (
+                spell.get("name")
+                or spell.get("abilityName")
+                or spell.get("spellName")
+                or ""
+            )
+            desc = (
+                spell.get("description")
+                or spell.get("tooltip")
+                or spell.get("desc")
+                or spell.get("spellDesc")
+                or ""
+            )
+            if name or desc:
+                abilities.append(
+                    {
+                        "key": key,
+                        "name": _strip_html(name),
+                        "description": _strip_html(desc),
+                    }
+                )
+
+    return abilities
+
+
+def _find_abilities_root(node: Any) -> dict[str, Any] | None:
+    if isinstance(node, dict):
+        for key in (
+            "spells",
+            "skills",
+            "abilities",
+            "passive",
+            "passiveName",
+            "passiveDesc",
+        ):
+            if key in node:
+                return node
+        for value in node.values():
+            found = _find_abilities_root(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_abilities_root(item)
+            if found:
+                return found
+    return None
+
+
+def _unwrap_champion_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("champion", "champion_data", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
+
+
+def _fetch_champion_detail(champ: dict[str, Any]) -> dict[str, Any] | None:
+    identifiers: list[str] = []
+    slug = champ.get("id") or champ.get("slug") or champ.get("alias")
+    if isinstance(slug, str) and slug:
+        identifiers.append(slug)
+    hero_id = champ.get("heroId") or champ.get("hero_id")
+    if hero_id:
+        identifiers.append(str(hero_id))
+
+    for identifier in identifiers:
+        try:
+            payload = _fetch_json(WR_DATABASE_CHAMPION_DETAIL.format(identifier))
+        except Exception:
+            continue
+        detail = _unwrap_champion_payload(payload)
+        if detail:
+            return detail
+
+    return None
+
+
+def _fetch_tencent_hero_detail(hero_id: str) -> dict[str, Any] | None:
+    for template in TENCENT_HERO_DETAIL_CANDIDATES:
+        url = template.format(hero_id)
+        payload = _fetch_json_loose(url)
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def sync_champions_from_tencent() -> dict[str, str]:
@@ -321,6 +502,78 @@ def sync_champion_stats() -> int:
 
         conn.commit()
         logger.info(f"Synced stats for {count} champions")
+
+    return count
+
+
+def sync_champion_abilities() -> int:
+    """
+    Sync abilities from the most up-to-date champion dataset.
+    """
+    if not POSTGRES_DSN:
+        return 0
+
+    logger.info("Fetching champion abilities from wr-database...")
+    data = _fetch_json(WR_DATABASE_CHAMPIONS)
+    champions = data.get("champions_data", [])
+
+    count = 0
+    with psycopg.connect(POSTGRES_DSN) as conn:
+        _ensure_game_tables(conn)
+
+        for champ in champions:
+            hero_id = champ.get("heroId")
+            if not hero_id or hero_id == 10666:
+                continue
+
+            hero_id_str = str(hero_id)
+            champ_name = champ.get("name") or champ.get("id") or ""
+            detail = _fetch_champion_detail(champ)
+            source = detail or champ
+            if detail:
+                champ_name = (
+                    detail.get("name")
+                    or detail.get("id")
+                    or detail.get("slug")
+                    or champ_name
+                )
+            abilities = _extract_abilities(source)
+            if not abilities:
+                tencent_detail = _fetch_tencent_hero_detail(hero_id_str)
+                if tencent_detail:
+                    root = _find_abilities_root(tencent_detail) or tencent_detail
+                    abilities = _extract_abilities(root)
+            if not abilities:
+                continue
+
+            conn.execute(
+                "DELETE FROM champion_abilities WHERE hero_id = %s",
+                (hero_id_str,),
+            )
+            for ability in abilities:
+                conn.execute(
+                    """
+                    INSERT INTO champion_abilities
+                        (hero_id, champion_name, ability_key, ability_name, description)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (hero_id, ability_key) DO UPDATE SET
+                        champion_name = EXCLUDED.champion_name,
+                        ability_name = EXCLUDED.ability_name,
+                        description = EXCLUDED.description,
+                        updated_at = NOW()
+                    """,
+                    (
+                        hero_id_str,
+                        champ_name,
+                        ability["key"],
+                        ability["name"],
+                        ability["description"],
+                    ),
+                )
+                count += 1
+
+        conn.commit()
+        logger.info("Synced %s champion abilities", count)
 
     return count
 
@@ -629,6 +882,7 @@ def sync_all() -> dict[str, int]:
         "stats": 0,
         "winrates": 0,
         "items": 0,
+        "abilities": 0,
     }
 
     try:
@@ -646,6 +900,11 @@ def sync_all() -> dict[str, int]:
         results["winrates"] = sync_winrates()
     except Exception:
         logger.exception("Failed to sync winrates")
+
+    try:
+        results["abilities"] = sync_champion_abilities()
+    except Exception:
+        logger.exception("Failed to sync champion abilities")
 
     try:
         results["items"] = sync_items_from_wrmeta()
@@ -700,6 +959,57 @@ def get_champion_info(champion_name: str) -> dict[str, Any] | None:
     except Exception:
         logger.exception("Failed to get champion info")
         return None
+
+
+def get_champion_abilities(champion_name: str) -> list[dict[str, Any]]:
+    """Fetch champion abilities by name."""
+    if not POSTGRES_DSN:
+        return []
+
+    try:
+        with psycopg.connect(POSTGRES_DSN) as conn:
+            hero_row = conn.execute(
+                """
+                SELECT hero_id FROM champions
+                WHERE LOWER(name_en) = LOWER(%s)
+                   OR LOWER(alias) = LOWER(%s)
+                   OR LOWER(name_cn) = %s
+                LIMIT 1
+                """,
+                (champion_name, champion_name, champion_name),
+            ).fetchone()
+            if not hero_row:
+                return []
+
+            hero_id = hero_row[0]
+            rows = conn.execute(
+                """
+                SELECT ability_key, ability_name, description
+                FROM champion_abilities
+                WHERE hero_id = %s
+                ORDER BY
+                    CASE ability_key
+                        WHEN 'passive' THEN 0
+                        WHEN 'q' THEN 1
+                        WHEN 'w' THEN 2
+                        WHEN 'e' THEN 3
+                        WHEN 'r' THEN 4
+                        ELSE 5
+                    END
+                """,
+                (hero_id,),
+            ).fetchall()
+            return [
+                {
+                    "key": row[0],
+                    "name": row[1],
+                    "description": row[2],
+                }
+                for row in rows
+            ]
+    except Exception:
+        logger.exception("Failed to get champion abilities")
+        return []
 
 
 def get_champion_winrate(champion_name: str, position: str | None = None) -> dict[str, Any] | None:

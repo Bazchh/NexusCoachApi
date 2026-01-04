@@ -11,9 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app import db, game_data
 from app.config import POSTGRES_DSN
-from scripts import seed_corrections
 
 
 def main() -> None:
@@ -23,11 +21,19 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     with psycopg.connect(POSTGRES_DSN) as conn:
-        db._ensure_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT c.hero_id, COALESCE(c.name_en, c.alias, c.name_cn) AS name
+            FROM champions c
+            LEFT JOIN champion_abilities a ON a.hero_id = c.hero_id
+            WHERE a.hero_id IS NULL
+            ORDER BY name
+            """
+        ).fetchall()
 
-    results = game_data.sync_all()
-    seed_corrections.apply()
-    print(results)
+    print(f"Champions missing abilities: {len(rows)}")
+    for hero_id, name in rows:
+        print(f"- {name} ({hero_id})")
 
 
 if __name__ == "__main__":
