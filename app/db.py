@@ -50,6 +50,32 @@ def _ensure_tables(conn: psycopg.Connection) -> None:
         on advice_bank (champion, lane, enemy, intent, game_phase, status, reply_text)
         """
     )
+    # Tabela de correções aprendidas do feedback
+    conn.execute(
+        """
+        create table if not exists corrections (
+            id bigserial primary key,
+            champion text,
+            ability text,
+            topic text,
+            wrong_info text not null,
+            correct_info text not null,
+            source_session text,
+            confidence int default 1,
+            created_at timestamptz default now()
+        )
+        """
+    )
+    conn.execute(
+        """
+        create index if not exists corrections_champion_idx on corrections (lower(champion))
+        """
+    )
+    conn.execute(
+        """
+        create index if not exists corrections_topic_idx on corrections (lower(topic))
+        """
+    )
 
 
 def persist_session_end(session: Session, feedback: dict[str, Any] | None) -> None:
@@ -83,6 +109,15 @@ def persist_session_end(session: Session, feedback: dict[str, Any] | None) -> No
             )
             if feedback:
                 _update_advice_from_session(conn, session, feedback)
+                # Extrai correção se feedback negativo com comentário
+                if feedback.get("rating") == "bad" and feedback.get("comment"):
+                    extract_correction_from_feedback(
+                        conn=conn,
+                        session_id=session.session_id,
+                        feedback_comment=feedback["comment"],
+                        history=session.history,
+                        state=session.state,
+                    )
             conn.commit()
     except Exception:
         logger.exception("postgres_persist_failed")
@@ -135,8 +170,13 @@ def _update_advice_from_session(
 def retrieve_advice(state: dict[str, Any], intent: str, limit: int = 3) -> list[str]:
     if not POSTGRES_DSN:
         return []
+    global _tables_ready
     try:
         with psycopg.connect(POSTGRES_DSN) as conn:
+            if not _tables_ready:
+                _ensure_tables(conn)
+                conn.commit()
+                _tables_ready = True
             rows = conn.execute(
                 """
                 select reply_text,
@@ -167,3 +207,246 @@ def retrieve_advice(state: dict[str, Any], intent: str, limit: int = 3) -> list[
     except Exception:
         logger.exception("advice_retrieve_failed")
         return []
+
+
+def _write_correction(
+    conn: psycopg.Connection,
+    champion: str | None,
+    ability: str | None,
+    topic: str | None,
+    wrong_info: str,
+    correct_info: str,
+    source_session: str | None,
+) -> None:
+    existing = conn.execute(
+        """
+        select id, confidence from corrections
+        where lower(coalesce(champion, '')) = lower(coalesce(%s, ''))
+          and lower(coalesce(ability, '')) = lower(coalesce(%s, ''))
+          and lower(coalesce(topic, '')) = lower(coalesce(%s, ''))
+          and lower(correct_info) = lower(%s)
+        limit 1
+        """,
+        (champion, ability, topic, correct_info),
+    ).fetchone()
+
+    if existing:
+        conn.execute(
+            "update corrections set confidence = confidence + 1 where id = %s",
+            (existing[0],),
+        )
+        return
+
+    conn.execute(
+        """
+        insert into corrections (champion, ability, topic, wrong_info, correct_info, source_session)
+        values (%s, %s, %s, %s, %s, %s)
+        """,
+        (champion, ability, topic, wrong_info, correct_info, source_session),
+    )
+
+
+def save_correction(
+    champion: str | None,
+    ability: str | None,
+    topic: str | None,
+    wrong_info: str,
+    correct_info: str,
+    source_session: str | None = None,
+    conn: psycopg.Connection | None = None,
+) -> bool:
+    """Salva uma correção no banco de dados."""
+    if not POSTGRES_DSN:
+        return False
+    try:
+        if conn is None:
+            with psycopg.connect(POSTGRES_DSN) as local_conn:
+                _ensure_tables(local_conn)
+                _write_correction(
+                    local_conn,
+                    champion,
+                    ability,
+                    topic,
+                    wrong_info,
+                    correct_info,
+                    source_session,
+                )
+                local_conn.commit()
+            return True
+
+        _ensure_tables(conn)
+        _write_correction(
+            conn,
+            champion,
+            ability,
+            topic,
+            wrong_info,
+            correct_info,
+            source_session,
+        )
+        return True
+    except Exception:
+        logger.exception("save_correction_failed")
+        return False
+
+
+def retrieve_corrections(
+    champions: list[str] | None = None,
+    topics: list[str] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Recupera correções relevantes para incluir no prompt."""
+    if not POSTGRES_DSN:
+        return []
+    global _tables_ready
+    try:
+        with psycopg.connect(POSTGRES_DSN) as conn:
+            if not _tables_ready:
+                _ensure_tables(conn)
+                conn.commit()
+                _tables_ready = True
+            # Busca correções que matcham os campeões ou tópicos
+            conditions = []
+            params: list[Any] = []
+
+            if champions:
+                placeholders = ", ".join(["%s"] * len(champions))
+                conditions.append(f"lower(champion) in ({placeholders})")
+                params.extend([c.lower() for c in champions])
+
+            if topics:
+                placeholders = ", ".join(["%s"] * len(topics))
+                conditions.append(f"lower(topic) in ({placeholders})")
+                params.extend([t.lower() for t in topics])
+
+            where_clause = ""
+            if conditions:
+                where_clause = "where " + " or ".join(conditions)
+
+            params.append(limit)
+
+            rows = conn.execute(
+                f"""
+                select champion, ability, topic, wrong_info, correct_info, confidence
+                from corrections
+                {where_clause}
+                order by confidence desc, created_at desc
+                limit %s
+                """,
+                params,
+            ).fetchall()
+
+            return [
+                {
+                    "champion": row[0],
+                    "ability": row[1],
+                    "topic": row[2],
+                    "wrong_info": row[3],
+                    "correct_info": row[4],
+                    "confidence": row[5],
+                }
+                for row in rows
+            ]
+    except Exception:
+        logger.exception("retrieve_corrections_failed")
+        return []
+
+
+def extract_correction_from_feedback(
+    session_id: str,
+    feedback_comment: str,
+    history: list[dict[str, Any]],
+    state: dict[str, Any],
+    conn: psycopg.Connection | None = None,
+) -> bool:
+    """
+    Extrai correção de um comentário de feedback usando LLM.
+    Chamado automaticamente quando feedback é 'bad' com comentário.
+    """
+    if not feedback_comment or len(feedback_comment.strip()) < 10:
+        return False
+
+    # Importa aqui para evitar circular import
+    from app.config import GEMINI_API_KEY, GEMINI_MODEL, LLM_PROVIDER
+
+    if LLM_PROVIDER != "gemini" or not GEMINI_API_KEY:
+        return False
+
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        return False
+
+    # Monta contexto da última interação
+    last_reply = ""
+    for item in reversed(history):
+        if item.get("reply"):
+            last_reply = item["reply"]
+            break
+
+    champion = state.get("champion", "")
+    enemy = state.get("enemy", "")
+
+    prompt = f"""Analise este feedback negativo de um usuário sobre uma dica de Wild Rift e extraia a correção se houver.
+
+Dica que o coach deu: "{last_reply}"
+
+Feedback do usuário: "{feedback_comment}"
+
+Campeão do usuário: {champion}
+Inimigo: {enemy}
+
+Se o feedback contém uma CORREÇÃO sobre mecânica do jogo (ex: "a skill atravessa minions", "o cooldown é 10s", etc), responda APENAS em JSON:
+{{"champion": "nome ou null", "ability": "nome da skill ou null", "topic": "tema geral ou null", "wrong_info": "o que estava errado", "correct_info": "informação correta"}}
+
+Se o feedback é apenas reclamação geral sem correção específica, responda:
+{{"no_correction": true}}
+
+Responda APENAS o JSON, nada mais."""
+
+    try:
+        logger.info("extract_correction: creating client...")
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"timeout": 30000},
+        )
+        logger.info("extract_correction: calling generate_content...")
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+            ),
+        )
+        logger.info(f"extract_correction: got response: {response.text[:100] if response and response.text else 'None'}")
+
+        if not response or not response.text:
+            return False
+
+        # Parse JSON da resposta
+        import re
+        text = response.text.strip()
+        # Remove markdown se houver
+        text = re.sub(r"```json\s*", "", text)
+        text = re.sub(r"```\s*", "", text)
+
+        data = json.loads(text)
+
+        if data.get("no_correction"):
+            return False
+
+        # Salva a correção
+        return save_correction(
+            champion=data.get("champion"),
+            ability=data.get("ability"),
+            topic=data.get("topic"),
+            wrong_info=data.get("wrong_info", ""),
+            correct_info=data.get("correct_info", ""),
+            source_session=session_id,
+            conn=conn,
+        )
+    except Exception:
+        logger.exception("extract_correction_failed")
+        return False

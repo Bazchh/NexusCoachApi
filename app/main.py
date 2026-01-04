@@ -8,7 +8,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from app import db, nlu, strategy, store, stt
+from app import db, game_data, nlu, strategy, store, stt
 from app.errors import AppError
 from app.i18n import msg
 from app.models import (
@@ -233,3 +233,64 @@ def _merge_item_hints(
             updates["last_enemy_item"] = {"champion": champion, "item": item}
 
     return updates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.post("/admin/sync-game-data")
+async def sync_game_data() -> JSONResponse:
+    """Sincroniza dados do jogo (campeões, stats, winrates) das APIs externas."""
+    logger.info("Starting game data sync...")
+    results = game_data.sync_all()
+    logger.info("Game data sync completed: %s", results)
+    return envelope_ok({
+        "synced": results,
+        "message": "Game data synchronized successfully",
+    })
+
+
+@app.get("/admin/champion/{champion_name}")
+async def get_champion(champion_name: str) -> JSONResponse:
+    """Busca informações de um campeão pelo nome."""
+    info = game_data.get_champion_info(champion_name)
+    if info is None:
+        raise AppError(
+            code="CHAMPION_NOT_FOUND",
+            user_message=f"Champion '{champion_name}' not found",
+            status_code=404,
+        )
+
+    winrate = game_data.get_champion_winrate(champion_name)
+    if winrate:
+        info["winrate"] = winrate
+
+    return envelope_ok(info)
+
+
+@app.get("/admin/item/{item_name}")
+async def get_item(item_name: str) -> JSONResponse:
+    """Busca informações de um item pelo nome."""
+    info = game_data.get_item_info(item_name)
+    if info is None:
+        raise AppError(
+            code="ITEM_NOT_FOUND",
+            user_message=f"Item '{item_name}' not found",
+            status_code=404,
+        )
+    return envelope_ok(info)
+
+
+@app.get("/admin/items")
+async def list_items(category: str | None = None) -> JSONResponse:
+    """Lista itens, opcionalmente filtrados por categoria."""
+    if category:
+        items = game_data.get_items_by_category(category, limit=50)
+    else:
+        # Lista todos os itens de todas as categorias
+        items = []
+        for cat in ["physical", "magic", "defense", "boots", "support"]:
+            items.extend(game_data.get_items_by_category(cat, limit=20))
+    return envelope_ok({"items": items, "count": len(items)})
