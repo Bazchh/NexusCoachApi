@@ -86,7 +86,4 @@ def generate_reply(
             context=context_hint,
         )
 
-    if last_reply:
-        return msg(locale, "continue_strategy", last_reply=last_reply)
-
     return msg(locale, "need_context")
