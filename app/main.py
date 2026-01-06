@@ -24,6 +24,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nexuscoach")
 
 app = FastAPI(title="NexusCoach API", version="0.1.0")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"→ {request.method} {request.url.path}")
+    try:
+        response = await call_next(request)
+        logger.info(f"← {request.method} {request.url.path} [{response.status_code}]")
+        return response
+    except Exception as e:
+        logger.exception(f"✗ {request.method} {request.url.path} error: {e}")
+        raise
 session_store = store.get_store()
 
 
