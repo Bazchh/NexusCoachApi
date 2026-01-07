@@ -72,6 +72,8 @@ def infer_intent(text: str) -> str:
     return "general"
 
 
+
+
 def extract_state_hints(text: str) -> dict[str, Any]:
     text_lower = _normalize(text)
     hints: dict[str, Any] = {}
@@ -200,14 +202,19 @@ def extract_champions(text: str) -> dict[str, Any]:
                     })
                     processed_enemies.add(champion)
 
-    # Adiciona campeões restantes que foram encontrados mas não processados
-    for champion in found_champions:
-        if champion not in processed_enemies and champion != result["player_champion"]:
-            enemies_with_status.append({
-                "champion": champion,
-                "status": "even",
-                "is_laner": False,
-            })
+    # Adiciona campeões restantes apenas se há sinal claro de inimigos
+    has_enemy_signal = bool(processed_enemies) or any(
+        keyword in text_lower
+        for keyword in ["contra", "versus", "vs", "against", "enfrentando"]
+    )
+    if has_enemy_signal:
+        for champion in found_champions:
+            if champion not in processed_enemies and champion != result["player_champion"]:
+                enemies_with_status.append({
+                    "champion": champion,
+                    "status": "even",
+                    "is_laner": False,
+                })
 
     result["enemies"] = enemies_with_status
     return result
@@ -228,8 +235,14 @@ def _find_all_champions(text: str) -> list[str]:
     # Ordena por tamanho decrescente para pegar "miss fortune" antes de "miss"
     sorted_champions = sorted(KNOWN_CHAMPIONS, key=len, reverse=True)
     for champion in sorted_champions:
-        if champion in text and champion not in found:
-            found.append(champion)
+        if champion in found:
+            continue
+        if " " in champion:
+            if champion in text:
+                found.append(champion)
+        else:
+            if re.search(rf"\\b{re.escape(champion)}\\b", text):
+                found.append(champion)
 
     return found
 

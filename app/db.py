@@ -28,6 +28,24 @@ def _ensure_tables(conn: psycopg.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists session_turns (
+            id bigserial primary key,
+            session_id text not null,
+            locale text,
+            state jsonb,
+            turn jsonb,
+            created_at timestamptz default now()
+        )
+        """
+    )
+    conn.execute(
+        """
+        create index if not exists session_turns_session_idx
+        on session_turns (session_id)
+        """
+    )
+    conn.execute(
+        """
         create table if not exists advice_bank (
             id bigserial primary key,
             champion text,
@@ -121,6 +139,100 @@ def persist_session_end(session: Session, feedback: dict[str, Any] | None) -> No
             conn.commit()
     except Exception:
         logger.exception("postgres_persist_failed")
+
+
+def persist_turn(session: Session, turn: dict[str, Any]) -> None:
+    if not POSTGRES_DSN:
+        return
+    global _tables_ready
+    try:
+        with psycopg.connect(POSTGRES_DSN) as conn:
+            if not _tables_ready:
+                _ensure_tables(conn)
+                _tables_ready = True
+            conn.execute(
+                """
+                insert into session_turns (session_id, locale, state, turn)
+                values (%s, %s, %s, %s)
+                """,
+                (
+                    session.session_id,
+                    session.locale,
+                    json.dumps(session.state),
+                    json.dumps(turn),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("postgres_persist_turn_failed")
+
+
+def fetch_session_turns(session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    if not POSTGRES_DSN:
+        return []
+    global _tables_ready
+    try:
+        with psycopg.connect(POSTGRES_DSN) as conn:
+            if not _tables_ready:
+                _ensure_tables(conn)
+                conn.commit()
+                _tables_ready = True
+            rows = conn.execute(
+                """
+                select turn, created_at
+                from session_turns
+                where session_id = %s
+                order by id desc
+                limit %s
+                """,
+                (session_id, limit),
+            ).fetchall()
+            results = []
+            for row in rows:
+                payload = row[0]
+                if not isinstance(payload, dict):
+                    payload = json.loads(payload)
+                payload = dict(payload)
+                payload["created_at"] = row[1].isoformat() if row[1] else None
+                results.append(payload)
+            return results
+    except Exception:
+        logger.exception("fetch_session_turns_failed")
+        return []
+
+
+def fetch_recent_turns(limit: int = 50) -> list[dict[str, Any]]:
+    if not POSTGRES_DSN:
+        return []
+    global _tables_ready
+    try:
+        with psycopg.connect(POSTGRES_DSN) as conn:
+            if not _tables_ready:
+                _ensure_tables(conn)
+                conn.commit()
+                _tables_ready = True
+            rows = conn.execute(
+                """
+                select session_id, turn, created_at
+                from session_turns
+                order by id desc
+                limit %s
+                """,
+                (limit,),
+            ).fetchall()
+            results = []
+            for row in rows:
+                payload = row[1]
+                if not isinstance(payload, dict):
+                    payload = json.loads(payload)
+                payload = dict(payload)
+                payload["session_id"] = row[0]
+                payload["created_at"] = row[2].isoformat() if row[2] else None
+                results.append(payload)
+            return results
+    except Exception:
+        logger.exception("fetch_recent_turns_failed")
+        return []
 
 
 def _update_advice_from_session(

@@ -160,6 +160,12 @@ def _process_turn(
     updates["last_user_text"] = text_clean
     updates["timestamp"] = (timestamp or datetime.now(tz=timezone.utc)).isoformat()
 
+    # Não permite troca de campeãok, maso/rota depois do contexto inicial.
+    if session.state.get("champion"):
+        updates.pop("champion", None)
+    if session.state.get("lane"):
+        updates.pop("lane", None)
+
     updated_session = session_store.update_session(session.session_id, updates)
     if updated_session is None:
         raise AppError(
@@ -182,25 +188,24 @@ def _process_turn(
         session.session_id,
         {"last_intent": intent, "last_reply": reply},
     )
-    session_store.append_history(
-        session.session_id,
-        {
-            "text": text_clean,
-            "reply": reply,
-            "intent": intent,
-            "context": {
-                "champion": updated_session.state.get("champion"),
-                "lane": updated_session.state.get("lane"),
-                "enemy": updated_session.state.get("enemy"),
-                "game_phase": updated_session.state.get("game_phase"),
-                "status": updated_session.state.get("status"),
-                "gold": updated_session.state.get("gold"),
-            },
-            "timestamp": updates["timestamp"],
+    turn_entry = {
+        "text": text_clean,
+        "reply": reply,
+        "intent": intent,
+        "context": {
+            "champion": updated_session.state.get("champion"),
+            "lane": updated_session.state.get("lane"),
+            "enemy": updated_session.state.get("enemy"),
+            "game_phase": updated_session.state.get("game_phase"),
+            "status": updated_session.state.get("status"),
+            "gold": updated_session.state.get("gold"),
         },
-    )
+        "timestamp": updates["timestamp"],
+    }
+    session_store.append_history(session.session_id, turn_entry)
 
     refreshed = session_store.get_session(session.session_id) or updated_session
+    db.persist_turn(refreshed, turn_entry)
     return {
         "reply_text": reply,
         "updated_state": refreshed.state,
@@ -306,3 +311,15 @@ async def list_items(category: str | None = None) -> JSONResponse:
         for cat in ["physical", "magic", "defense", "boots", "support"]:
             items.extend(game_data.get_items_by_category(cat, limit=20))
     return envelope_ok({"items": items, "count": len(items)})
+
+
+@app.get("/admin/session/{session_id}/turns")
+async def get_session_turns(session_id: str, limit: int = 50) -> JSONResponse:
+    turns = db.fetch_session_turns(session_id, limit=limit)
+    return envelope_ok({"session_id": session_id, "turns": turns})
+
+
+@app.get("/admin/turns")
+async def get_recent_turns(limit: int = 50) -> JSONResponse:
+    turns = db.fetch_recent_turns(limit=limit)
+    return envelope_ok({"turns": turns})
